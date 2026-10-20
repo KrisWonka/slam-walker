@@ -1,255 +1,225 @@
-# slam_walking_robot
+# SlamWalker — LiDAR SLAM and Navigation on a Walking Robot
 
-A 2D-LiDAR SLAM and autonomous-navigation stack for a small **walking robot** built around a Jetson Orin Nano and an Arduino-driven motor base. The robot uses a mechanical walking mechanism (not a wheeled chassis) and exposes itself to ROS 2 as a differential-drive platform so that off-the-shelf SLAM and Nav2 components work out of the box.
+**English** | [中文](README.zh-CN.md)
 
-The repository contains:
+Off-the-shelf navigation stacks assume wheels. This chassis **walks** — a six-bar linkage with a large
+start-up dead-zone, a lurch on every gait cycle, and feet that slip, so its odometry is unreliable.
+This repository is the full ROS 2 stack that makes it map and navigate anyway: electrical integration
+and Arduino firmware, a calibrated odometry bridge, slam_toolbox + AMCL + Nav2, a frontier explorer
+that prices in what turning costs a walking machine, and a custom RViz operator panel.
 
-- **`src/slamwalker_bridge/`** — Python ROS 2 package: `serial_bridge_node` (cmd_vel ⇄ Arduino, encoder odometry) and a keyboard `teleop`.
-- **`src/slamwalker_bringup/`** — launch files, RViz configs, slam_toolbox/Nav2 parameters, URDF/Xacro.
-- **`src/ldlidar_ros2/`** — vendored LDRobot LD06/LD14/LD19 driver (with a submodule for the C++ SDK).
-- **`arduino/`** — UNO firmware (`test/test.ino`), upload script, and several diagnostic/calibration sketches.
-- **`scripts/calibrate.py`** — interactive walking-mechanism odometry calibrator.
-- **`maps/`** — a saved `my_map.{pgm,yaml}` ready to use for navigation.
-- **`simulation/`** — TurtleBot4 + Gazebo reference simulation (used for tuning, kept as a separate workspace).
+<p align="center">
+  <img src="docs/media/slam_explore.webp" width="840" alt="Left: the walking robot exploring an office on its own. Right: the occupancy map it is building in RViz, with frontiers and the planned path.">
+</p>
+<p align="center"><sub>Autonomous frontier exploration — nobody is driving. Left: the robot; right: the map it is building over the same 130 s (shown at 6×).</sub></p>
 
----
+> **Project context** — Undergraduate thesis, Dalian University of Technology, carried out in
+> Prof. McCarthy's lab at UC Irvine, Jan – May 2026. The walking platform is the lab's
+> build of an existing six-bar design; **everything that makes it navigate is mine**: electrical
+> integration, the 20 Hz firmware, parameter identification, the ROS 2 / Nav2 stack, the frontier
+> utility and its ablation, and the physical error measurement.
+> Write-up with videos: [krisxia.com/slam](https://krisxia.com/slam.html)
+
+## Results
+
+| | |
+|---|---|
+| **Localization RMSE (AMCL, on the real robot)** | **0.211 m** — mean 0.199 m, 95th percentile 0.311 m, N = 35, encoder odometry + LiDAR only, no IMU |
+| **Accumulated heading change** (simulated ablation) | **−44%** — 1899° → 1056° |
+| **Path length** (simulated ablation) | **−36%** — 20.97 m → 13.49 m |
+| **Map coverage** (simulated ablation) | 75.8% → **82.4%** |
+
+The three ablation rows come from a 2 × 2 study **in simulation** (turn penalty on/off × ideal vs.
+walking-mechanism physics, five runs per condition); the numbers above are the walking-physics pair.
+
+## Phase 1 — locomotion-aware frontier exploration
+
+The classic frontier rule (Yamauchi 1997, `explore_lite`) scores a candidate on distance and
+information gain. On a wheeled base that is fine — spinning in place is nearly free. On a six-bar walker
+it is the most expensive thing you can ask for: it slips, which costs a great deal of extra distance,
+and every slip corrupts the odometry that localization depends on. So the utility gets an explicit
+turning term:
+
+```
+U = γ · information_gain − α · distance − β · |heading change|
+```
+
+With β = 0 the explorer reduces to an `explore_lite`-style baseline, which is how the ablation was run.
+In the walking-physics simulation, β = 2.5 cut accumulated turning by 44% and path length by 36% while
+coverage went **up** — so the robot was not simply giving up early. The weights tuned for the real robot
+are in `src/slamwalker_explore/config/explore.yaml`.
+
+Around the utility, `frontier_explorer_node.py` also handles what a real room throws at it: frontier
+clustering with a minimum-information-gain cut, snapping each goal to the lowest-cost cell of its
+cluster so it never lands in the inflation layer, goal timeouts and no-progress detection, hysteresis
+against goal thrashing, and an automatic map save when no reachable frontier remains.
+
+## Phase 2 — navigation on the saved map
+
+<p align="center">
+  <img src="docs/media/slam_nav.webp" width="840" alt="Left: the robot walking to a goal. Right: AMCL pose and planned path on the saved map in RViz.">
+</p>
+<p align="center"><sub>Goal navigation on the saved map with AMCL (sped up). Left: the robot; right: planned path and live pose.</sub></p>
+
+slam_toolbox for graph SLAM, AMCL for localization on the saved map, and Nav2 with a DWB local
+controller and a behavior-tree navigator (Smac 2D global planner during exploration, NavFn on the saved
+map), re-tuned for a machine whose top speed is **0.10 m/s**.
+
+**The hard part was the model, not the stack.** Textbook differential-drive kinematics did not describe
+this machine, so instead of trusting the nominal geometry I measured the four scalars that reconcile the
+model with the prototype:
+
+| Parameter | Value | Where |
+|---|---|---|
+| Encoder ticks per metre | **15 623.1** (1.57 × the geometric value) | `slamwalker_nav.launch.py`, `slamwalker_explore.launch.py` |
+| Effective wheelbase | **0.3913 m** | same |
+| Right-encoder correction | `right_encoder_scale` | same |
+| PWM dead-zone | **120 / 255** — below this the robot does not move | `arduino/test/test.ino` (`PWM_MIN_MOVE`) |
+
+`scripts/calibrate.py` walks through the measurement (drive a known distance → ticks per metre; rotate
+a known angle → effective wheelbase) and prints the parameters to paste back in.
+
+## Verification — how wrong is it, in metres?
+
+<img align="right" width="400" src="docs/media/amcl_error_trials.jpg" alt="Five trial trajectories overlaid on the occupancy grid, with seven hand-measured floor marks M1 to M7 shown as white crosses and the AMCL position estimate at each.">
+
+Seven taped marks on the floor, five trials. In each trial the robot is driven through all seven; at each
+mark it stops, a logging script records what AMCL believes, and the true (x, y) is measured by hand
+off the tape — 5 × 7 = 35 paired samples.
+
+| AMCL position error | |
+|---|---|
+| Samples | N = 35 |
+| Mean | 0.199 m |
+| **RMSE** | **0.211 m** |
+| 95th percentile | 0.311 m |
+
+**Why no IMU.** Fusing one through an EKF would absorb slip and sharpen heading, and it is the obvious
+next step. It was left out on purpose: the point was to find out what the LiDAR scan-matcher and the
+calibration are worth on their own. 0.211 m is that number.
+
+<br clear="right">
 
 ## Hardware
 
+<table>
+  <tr>
+    <td width="47%"><img src="docs/media/electronics_deck.jpg" alt="The robot's electronics deck: LiDAR on its mast at the back, the Jetson enclosure on the left, and the stacked driver boards in the middle."></td>
+    <td width="53%"><img src="docs/media/wiring.jpg" alt="Wiring diagram: Jetson, USB-to-TTL adapter and LD19 LiDAR at the left, Arduino UNO in the middle, two Cytron SHIELD-MD10 R2 boards to its right, two encoder gearmotors above, a 1000 µF electrolytic on the first driver's power terminals, and the battery at bottom left."></td>
+  </tr>
+</table>
+<p align="center"><sub>Left: The deck as built · Right: Wiring (drawn side by side; on the robot the two drivers are stacked)</sub></p>
+
 | Item | Spec |
-|------|------|
-| SBC | NVIDIA Jetson Orin Nano Developer Kit 8 GB, JetPack 6.2 on a 32 GB microSD |
-| MCU | Arduino UNO (ATmega328P) |
-| Motor driver | HW-095 (L298N) breakout |
-| Motors | 2× Pololu #4754 — 37D 70:1 metal gearmotor with 64 CPR Hall encoder |
-| LiDAR | LDRobot **LD19** (CP210x, 230400 baud) |
-| Mechanism | Custom walking linkage; effective ratio measured at **21333 ticks / metre** (≈ 2.14× extra reduction beyond the 70:1 gearmotor) |
-| Body | 0.52 m × 0.356 m × 0.08 m |
+|---|---|
+| Compute | NVIDIA Jetson Orin Nano 8 GB, JetPack 6.2, ROS 2 Humble |
+| MCU | Arduino UNO — 115200 baud USB-CDC, 20 Hz encoder reports, 500 ms command watchdog |
+| Motor drivers | 2 × Cytron SHIELD-MD10 R2, stacked, one channel each |
+| Motors | 2 × Pololu 37D 70:1 gearmotors with 64 CPR Hall encoders |
+| LiDAR | LDRobot LD19, 230400 baud |
 
-The Arduino exposes a USB-CDC serial port (`/dev/ttyACM0`, symlinked as `/dev/arduino` via udev) at 115200 baud. The LiDAR appears as `/dev/ttyUSB0` (symlinked as `/dev/ldlidar`).
+**Two lessons from bring-up:**
 
-### TF tree
+- **The first driver had to go.** The chassis originally ran on an L298N: a bipolar bridge that drops
+  about 2.5 V across itself and is rated 2 A per channel continuous. Two gearmotors pushing a six-bar
+  linkage — whose friction throws up current spikes constantly — do not sit under that number, and it
+  failed on stall current. It was replaced by the MD10 pair, which is also why the dead-zone fell to
+  120/255.
+- **The "serial bug" was a brown-out.** Every hard acceleration or reversal dropped the Arduino's USB and
+  sent the bridge into a reconnect loop. Motor back-EMF was bouncing the Arduino's ground and pushing its
+  USB 5 V out of spec. Fixed with a ground lead from the Arduino straight to pack negative (bypassing
+  two stacked shield connectors) and a 1000 µF / 35 V electrolytic across driver #1's power terminals.
 
-```
-map ──► odom ──► base_footprint ──► base_link ──► base_laser
-                                              ├── left_wheel
-                                              └── right_wheel
-```
-
-`serial_bridge_node` publishes `odom → base_footprint`. `robot_state_publisher` (from the URDF) publishes everything below `base_link`. `slam_toolbox` (mapping) or `amcl` (localisation) publishes `map → odom`.
-
-### Arduino pin map (`arduino/test/test.ino`)
+## Repository layout
 
 ```
-D2  Left  encoder A   (INT0)
-D3  Right encoder A   (INT1)
-D4  Left  encoder B
-D5  Right ENB (PWM)
-D6  Right IN3
-D7  Right encoder B
-D8  Right IN4
-D9  Left  IN2
-D11 Left  ENA (PWM)
-D12 Left  IN1
+src/
+  slamwalker_bridge/       serial_bridge_node (cmd_vel ⇄ Arduino, encoder odometry, speed scale), teleop
+  slamwalker_bringup/      launch files, URDF/Xacro, slam_toolbox / Nav2 / RViz configs
+  slamwalker_explore/      frontier_explorer, session_manager (Phase 1 ⇄ Phase 2), scan_resampler
+  slamwalker_rviz_panel/   RViz operator panel (C++/Qt)
+  ldlidar_ros2/            vendored LDRobot LD06/LD14/LD19 driver
+arduino/
+  test/test.ino            runtime firmware
+  motor_test/ motor_diag/ motor_both/ rotation_test/ calibrate/   bring-up and diagnostic sketches
+scripts/                   calibrate.py (guided), auto_calibrate.py
+maps/                      saved maps (my_map: teleop SLAM, auto_map: Phase 1 output)
+simulation/                maps and helper scripts from the simulation runs
+docs/media/                images and clips for this README
 ```
 
-> Note: pins D10 and the original D12 IN3 had stopped working on this particular UNO; the firmware was re-mapped accordingly. If your board is fresh, the layout in `NAV_BRIDGE_GUIDE.md` (the pre-rewire version) is the recommended baseline.
+**Topic flow.** The LD19 driver publishes `/scan_raw` with a beam count that varies per rotation;
+slam_toolbox (Karto) silently drops scans whose count changes, so `scan_resampler` republishes every
+scan onto a fixed 360-beam `/scan`. `serial_bridge_node` turns `/cmd_vel` into `V<linear>,<angular>#`
+frames and the Arduino's `O<dTickL>,<dTickR>,<dt_ms>` reports into `/odom` and the
+`odom → base_footprint` transform.
 
-### Serial protocol
-
-| Direction | Frame | Meaning |
-|-----------|-------|---------|
-| ROS → MCU | `V<linear_x>,<angular_z>#\n` | Velocity command, m/s and rad/s |
-| MCU → ROS | `O<dTickL>,<dTickR>,<dt_ms>\n` | Encoder delta, 20 Hz |
-| MCU → ROS | `D ...` (ASCII debug line) | 1 Hz debug — PWM, encoder totals, pin states |
-| MCU → ROS | `READY\n` | Boot banner |
-
-Hard-coded safety: if no `V` frame is received for **500 ms**, motors stop.
-
-The walking mechanism has a real PWM dead-zone of around **180 / 255**, so non-zero velocity commands are remapped into the **[180, 255]** range; below `MAX_SPEED * 0.01` the output is forced to 0.
-
----
-
-## Software requirements
-
-- **Ubuntu 22.04** on the Jetson with **ROS 2 Humble** (the JetPack 6.2 default works).
-- ROS 2 packages: `slam_toolbox`, `nav2_bringup`, `nav2_map_server`, `nav2_rviz_plugins`, `robot_state_publisher`, `xacro`, `rviz2`.
-- Python: `pyserial` (≥ 3.5).
-- For Arduino: `arduino-cli` and `avrdude`.
-
-```bash
-sudo apt update && sudo apt install -y \
-  ros-humble-slam-toolbox \
-  ros-humble-nav2-bringup \
-  ros-humble-nav2-rviz-plugins \
-  ros-humble-robot-state-publisher \
-  ros-humble-xacro \
-  ros-humble-rviz2 \
-  python3-serial \
-  avrdude
-# arduino-cli: see https://arduino.github.io/arduino-cli/
-```
-
----
+**Operator panel.** `slamwalker_rviz_panel` adds an RViz dock with an emergency stop, *Start Frontier*,
+*Done → switch to Phase 2*, saved-map loading, pose reset, and a global speed-scale slider; the buttons
+call `session_manager`'s `/walker/*` services, which tear down one stack and bring up the other.
 
 ## Build
 
-Clone the workspace and its submodule (the LD-LiDAR vendor SDK):
+On the Jetson (Ubuntu 22.04, ROS 2 Humble):
 
 ```bash
-git clone --recursive https://github.com/KrisWonka/slam_walking_robot.git ~/walker_ws
+sudo apt install -y ros-humble-slam-toolbox ros-humble-nav2-bringup ros-humble-nav2-rviz-plugins \
+  ros-humble-robot-state-publisher ros-humble-xacro ros-humble-rviz2 python3-serial avrdude
+git clone https://github.com/KrisWonka/slam-walker.git ~/walker_ws
 cd ~/walker_ws
-# udev rule for the LiDAR (one-time)
-bash src/ldlidar_ros2/scripts/create_udev_rules.sh
-# build
+bash src/ldlidar_ros2/scripts/create_udev_rules.sh   # LiDAR → /dev/ldlidar
 colcon build --symlink-install
 source install/setup.bash
 ```
 
-If you forgot `--recursive`:
-
-```bash
-cd ~/walker_ws/src/ldlidar_ros2 && git submodule update --init --recursive
-```
-
-A udev rule for the Arduino is also recommended so that the launch files can use `/dev/arduino` instead of `/dev/ttyACM0`. A minimal rule:
+The launch files expect the Arduino at `/dev/arduino`; a minimal udev rule:
 
 ```udev
 # /etc/udev/rules.d/99-arduino.rules
 SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", SYMLINK+="arduino", MODE="0666", GROUP="dialout"
 ```
 
-Add your user to `dialout`:
-
-```bash
-sudo usermod -aG dialout $USER && newgrp dialout
-```
-
----
-
-## Flash the Arduino
-
-```bash
-arduino-cli compile --fqbn arduino:avr:uno ~/walker_ws/arduino/test
-cd ~/walker_ws/arduino && bash upload.sh         # press RESET when prompted
-```
-
-`upload.sh` finds the most recent `test.ino.hex` from the `arduino-cli` cache and flashes it with `avrdude`.
-
-Other sketches in `arduino/` are diagnostic helpers, not part of the runtime stack:
-
-- `motor_diag/` — print the four encoder pin levels + cumulative ticks at 1 Hz.
-- `motor_test/` — sweep PWM and report whether each side moves (used to discover the dead-zone).
-- `rotation_test/` — fixed-tick rotation for measuring `ticks_per_meter`.
-- `calibrate/` — same idea, dead-zone scan version.
-- `test_hybrid/` — experimental variant; keep `test/test.ino` as the runtime firmware.
-
----
+Flash the firmware with `arduino-cli compile --fqbn arduino:avr:uno arduino/test`, then
+`bash arduino/upload.sh` (press RESET when prompted).
 
 ## Run
 
-A handy cheatsheet also lives in [`commands`](commands).
-
-### 1. Build a map (SLAM)
-
 ```bash
+# Phase 1 — explore autonomously; saves maps/auto_map.yaml when no reachable frontier is left
+ros2 launch slamwalker_explore slamwalker_explore.launch.py
+
+# Phase 2 — navigate on a saved map (2D Pose Estimate to seed AMCL, then Nav2 Goal)
+ros2 launch slamwalker_bringup slamwalker_nav.launch.py map:=$HOME/walker_ws/maps/auto_map.yaml
+
+# Operator panel: run the session manager, then open RViz with the panel config
+ros2 run slamwalker_explore session_manager
+rviz2 -d src/slamwalker_explore/config/explore.rviz
+
+# Manual mapping instead of Phase 1
 ros2 launch slamwalker_bringup slamwalker_slam.launch.py
-# in another terminal
-ros2 run slamwalker_bridge teleop                # WASD + arrows
-# when satisfied, save:
+ros2 run slamwalker_bridge teleop
 ros2 run nav2_map_server map_saver_cli -f ~/walker_ws/maps/my_map
 ```
 
-RViz opens automatically with `slam.rviz` pre-configured (Map + LaserScan + TF + RobotModel, top-down view).
-
-### 2. Navigate using a saved map
-
-```bash
-ros2 launch slamwalker_bringup slamwalker_nav.launch.py \
-    map:=~/walker_ws/maps/my_map.yaml
-```
-
-In RViz: click **2D Pose Estimate** to seed AMCL, then **Nav2 Goal** (or use the Navigation 2 panel) to send a goal.
-
-### 3. Useful launch arguments
-
-| Arg | Default | Notes |
-|-----|---------|-------|
-| `serial_port` | `/dev/arduino` | Arduino USB device |
-| `lidar_port` | `/dev/ldlidar` | LD19 device |
-| `lidar_model` | `LDLiDAR_LD19` | Other LD-series models also supported |
-| `rviz` (slam) | `true` | Set `false` for headless operation |
-| `map` (nav) | required | Path to the `.yaml` saved by `map_saver_cli` |
-
----
-
-## Calibration
-
-The walking mechanism's effective `ticks_per_meter` and wheel base must be measured experimentally. The default values in `slamwalker_slam.launch.py` (`ticks_per_meter: 21333.0`, `wheel_base: 0.26`) are correct for the as-built robot but should be re-measured if the mechanism changes.
-
-A guided two-step calibrator is provided:
-
-```bash
-ros2 launch slamwalker_bringup slamwalker_slam.launch.py rviz:=false
-# in another terminal
-python3 ~/walker_ws/scripts/calibrate.py
-```
-
-It walks you through:
-
-1. Driving in a straight line by a known distance → derives `ticks_per_meter`.
-2. Rotating in place by a known angle → derives the **effective** `wheel_base`.
-
-Plug the resulting numbers into the `serial_bridge` parameters in both launch files.
-
----
-
-## Tuning notes
-
-These parameters are the ones most likely to need adjustment on a different build of the same robot, and where to find them:
-
-| Parameter | File | Purpose |
-|---|---|---|
-| `MAX_SPEED`, `PWM_MIN_MOVE` | `arduino/test/test.ino` | Map normalised speed → PWM range; lower `MAX_SPEED` for more torque, raise `PWM_MIN_MOVE` to stay above the dead-zone |
-| `LEFT_MOTOR_SCALE`, `RIGHT_MOTOR_SCALE` | `arduino/test/test.ino` | Per-motor PWM trim for left/right balance |
-| `WHEEL_BASE` | `arduino/test/test.ino` and the launch files | Differential-drive kinematics (in metres) |
-| `ticks_per_meter` | `slamwalker_*.launch.py` | Encoder → distance conversion |
-| `right_encoder_scale` | `serial_bridge_node.py` (param `right_encoder_scale`) | Compensate per-side encoder count drift |
-| `inflation_radius`, footprint | `config/nav2_real.yaml` | Costmap inflation and robot polygon |
-| `min_speed_xy`, `min_speed_theta`, `min_rotational_vel` | `config/nav2_real.yaml` | Keep DWB samples above the motor dead-zone |
-| `minimum_travel_distance` | `config/slam_toolbox.yaml` | How often slam_toolbox publishes a TF/map update |
-
----
+Useful launch arguments: `serial_port` (default `/dev/arduino`), `lidar_port` (`/dev/ldlidar`),
+`lidar_model` (`LDLiDAR_LD19`); for exploration also `start_explorer`.
 
 ## Troubleshooting
 
-- **`map_server` fails with `parameter 'yaml_filename' is not initialized`** — `nav2_real.yaml` must contain `map_server` and `amcl` sections; Nav2's `RewrittenYaml` only injects values for keys that already exist.
-- **`map:=~/...` not expanded** — the launch file expands `~` via `OpaqueFunction`/`os.path.expanduser`. If you write the path yourself, use `$HOME` or the absolute path.
-- **TF has two unconnected trees** — `serial_bridge_node` must publish `odom → base_footprint`, not `odom → base_link`, otherwise `base_link` gets two parents.
-- **LiDAR scan looks rotated** — check the `base_link → base_laser` rpy in `slamwalker.urdf.xacro`; the stock LD19 mount uses `rpy="0 0 0"`.
-- **Robot doesn't move at low speeds** — the walking mechanism has a high PWM dead-zone (~180/255). Confirm with `arduino/motor_test/`.
-- **`Navigation 2` panel fails to load in RViz** — the plugin class name has a space in it (`nav2_rviz_plugins/Navigation 2`); the `nav.rviz` in this repo already uses the right name.
-- **LiDAR data publish time-out, intermittently** — almost always USB hub power. Plug the LD19 directly into the Jetson, or use a powered hub.
-
----
-
-## Simulation
-
-`simulation/` is a separate ROS 2 workspace built around TurtleBot4 + Gazebo, used as a reference while tuning the real robot. See `simulation/SIM_WORLD_CHANGELOG_BILINGUAL.md` for the world / config history. It is not required to run the real robot.
-
----
-
-## Status
-
-- ✅ SLAM mapping, map saving, AMCL localisation, Nav2 goal navigation, RViz visualisation, keyboard teleop.
-- 🟡 Per-motor PWM trim is still hand-tuned (`RIGHT_MOTOR_SCALE`).
-- 🟡 No IMU fusion; odometry is encoder-only.
-- ⚠️ LD19 occasional point-cloud time-outs depend on USB-hub power quality.
-
----
+- **Robot does not move at low speed** — the walking mechanism's dead-zone; confirm with
+  `arduino/motor_test/`. Nav2's `min_speed_*` settings keep DWB samples above it.
+- **USB drops when the motors reverse** — see the brown-out note above: grounding and bulk capacitance,
+  not the serial code.
+- **slam_toolbox ignores most scans** — make sure `scan_resampler` is running and slam_toolbox listens
+  on `/scan`, not `/scan_raw`.
+- **TF has two unconnected trees** — the bridge must publish `odom → base_footprint`, not
+  `odom → base_link`.
+- **`map_server` complains `yaml_filename` is not initialized** — Nav2's `RewrittenYaml` only fills keys
+  that already exist, so the params file needs `map_server` and `amcl` sections.
+- **Intermittent LiDAR time-outs** — almost always USB power; plug the LD19 into the Jetson directly or
+  use a powered hub.
 
 ## Acknowledgements
 
-- LDRobot LDLiDAR ROS 2 driver: <https://github.com/ldrobotSensorTeam/ldlidar_ros>
-- TurtleBot4 (used as the simulation reference): <https://github.com/turtlebot/turtlebot4>
-- Pololu 37D 70:1 motor #4754: <https://www.pololu.com/product/4754>
+- LDRobot LDLiDAR ROS 2 driver — <https://github.com/ldrobotSensorTeam/ldlidar_ros2>
+- slam_toolbox, Nav2, and the TurtleBot 4 simulation used as a reference while tuning
