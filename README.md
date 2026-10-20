@@ -134,14 +134,14 @@ calibration are worth on their own. 0.211 m is that number.
 
 ```
 src/
-  slamwalker_bridge/       serial_bridge_node (cmd_vel ⇄ Arduino, encoder odometry, speed scale), teleop
+  slamwalker_bridge/       serial_bridge_node (cmd_vel ⇄ Arduino, odometry), teleop
   slamwalker_bringup/      launch files, URDF/Xacro, slam_toolbox / Nav2 / RViz configs
-  slamwalker_explore/      frontier_explorer, session_manager (Phase 1 ⇄ Phase 2), scan_resampler
+  slamwalker_explore/      frontier_explorer, session_manager, scan_resampler
   slamwalker_rviz_panel/   RViz operator panel (C++/Qt)
   ldlidar_ros2/            vendored LDRobot LD06/LD14/LD19 driver
 arduino/
   test/test.ino            runtime firmware
-  motor_test/ motor_diag/ motor_both/ rotation_test/ calibrate/   bring-up and diagnostic sketches
+  motor_test/, motor_diag/, …   bring-up and diagnostic sketches
 scripts/                   calibrate.py (guided), auto_calibrate.py
 maps/                      saved maps (my_map: teleop SLAM, auto_map: Phase 1 output)
 simulation/                maps and helper scripts from the simulation runs

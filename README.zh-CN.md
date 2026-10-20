@@ -99,14 +99,14 @@ slam_toolbox 做图优化 SLAM，AMCL 在保存的地图上定位，Nav2 用 DWB
 
 ```
 src/
-  slamwalker_bridge/       serial_bridge_node（cmd_vel ⇄ Arduino、编码器里程计、速度缩放）、键盘遥控
+  slamwalker_bridge/       serial_bridge_node（cmd_vel ⇄ Arduino、里程计）、遥控
   slamwalker_bringup/      launch 文件、URDF/Xacro、slam_toolbox / Nav2 / RViz 配置
-  slamwalker_explore/      frontier_explorer、session_manager（第一 ⇄ 第二阶段切换）、scan_resampler
+  slamwalker_explore/      frontier_explorer、session_manager、scan_resampler
   slamwalker_rviz_panel/   RViz 操作面板（C++/Qt）
   ldlidar_ros2/            内置的 LDRobot LD06/LD14/LD19 驱动
 arduino/
   test/test.ino            运行时固件
-  motor_test/ motor_diag/ motor_both/ rotation_test/ calibrate/   上车调试与诊断用的程序
+  motor_test/、motor_diag/ 等   上车调试与诊断用的程序
 scripts/                   calibrate.py（引导式标定）、auto_calibrate.py
 maps/                      保存的地图（my_map：遥控 SLAM 建的；auto_map：第一阶段输出）
 simulation/                仿真实验用的地图和辅助脚本
